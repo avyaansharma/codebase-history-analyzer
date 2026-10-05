@@ -261,14 +261,22 @@ def ask(
     from rich.console import Console
     from rich.panel import Panel
     from rich.markdown import Markdown
+    from rich import box
     console = Console()
     
-    console.print(f"[bold cyan]🔍 Forensic Query:[/bold cyan] {question}")
-    with console.status("[bold green]Running LangGraph agent forensic reasoning loop...[/bold green]"):
+    console.print(f"\n[bold cyan]🔍 Forensic Investigation:[/bold cyan] [bold white]{question}[/bold white]")
+    with console.status("[bold green]Running LangGraph multi-hop forensic reasoning agent...[/bold green]"):
         res = ask_tool(question, repo_id=repo_id)
         
-    console.print("\n")
-    console.print(Panel(Markdown(res), title="[bold green]🏺 Forensic Analysis & Causal Rationale[/bold green]", border_style="green"))
+    console.print("")
+    console.print(Panel(
+        Markdown(res),
+        title="[bold green]🏺 Forensic Analysis & Causal Rationale[/bold green]",
+        subtitle="[dim]Grounded in git commits, diffs, AST symbols & PR discussions[/dim]",
+        border_style="bright_green",
+        box=box.ROUNDED,
+        padding=(1, 2)
+    ))
 
 @app.command()
 def hotspots(
@@ -280,18 +288,29 @@ def hotspots(
     repo_id = _configure_repo_env(repo_path=repo, db_path=db_path)
     from archaeologist.mcp_server.tools import repo_hotspots_tool
     from rich.table import Table
+    from rich import box
     console = _get_console()
     
     res = repo_hotspots_tool(top_n=top_n, repo_id=repo_id)
     hotspots_list = res if isinstance(res, list) else res.get("hotspots", [])
     
-    table = Table(title="Repository Hotspot Files (Commit Frequency)", border_style="bright_blue")
-    table.add_column("Rank", justify="right", style="cyan", no_wrap=True)
+    max_c = max([item.get("commit_count", 0) for item in hotspots_list] or [1])
+    table = Table(
+        title="🔥 Repository Hotspot Files (Commit Frequency)",
+        border_style="bright_blue",
+        box=box.ROUNDED,
+        header_style="bold bright_white on dark_blue"
+    )
+    table.add_column("Rank", justify="center", style="bold cyan", no_wrap=True)
     table.add_column("File Path", style="bold white")
-    table.add_column("Commit Count", justify="right", style="magenta")
+    table.add_column("Commits", justify="right", style="bold magenta")
+    table.add_column("Churn Visual", justify="left", style="magenta")
     
     for idx, item in enumerate(hotspots_list, 1):
-        table.add_row(str(idx), item.get("file_path", ""), str(item.get("commit_count", 0)))
+        c_count = item.get("commit_count", 0)
+        bar_len = max(1, int((c_count / max_c) * 16)) if max_c > 0 else 1
+        bar_visual = "█" * bar_len
+        table.add_row(f"#{idx}", item.get("file_path", ""), f"{c_count:,}", f"[magenta]{bar_visual}[/magenta]")
         
     console.print(table)
 
@@ -305,27 +324,44 @@ def ownership(
     repo_id = _configure_repo_env(repo_path=repo, db_path=db_path)
     from archaeologist.mcp_server.tools import repo_ownership_tool
     from rich.table import Table
+    from rich.panel import Panel
+    from rich import box
     console = _get_console()
     
     res = repo_ownership_tool(file_path=file_path, repo_id=repo_id)
-    title = f"Code Ownership & Bus Factor: {file_path}" if file_path else "Repository-Wide Author Contribution Distribution"
-    table = Table(title=title, border_style="cyan")
+    title = f"👥 Code Ownership: {file_path}" if file_path else "👥 Repository-Wide Author Contribution Distribution"
+    table = Table(
+        title=title,
+        border_style="cyan",
+        box=box.ROUNDED,
+        header_style="bold bright_white on dark_cyan"
+    )
     table.add_column("Author", style="bold white")
     table.add_column("Commits", justify="right", style="cyan")
-    table.add_column("Share %", justify="right", style="green")
+    table.add_column("Share %", justify="right", style="bold green")
+    table.add_column("Contribution", justify="left", style="green")
     
     distribution = res.get("author_distribution", {})
     sorted_authors = sorted(distribution.items(), key=lambda x: x[1].get("commit_count", 0), reverse=True)
     for author, stats in sorted_authors[:15]:
+        pct = stats.get('percentage', 0.0)
+        bar_len = max(1, int(pct / 100 * 16))
+        bar_visual = "█" * bar_len
         table.add_row(
             author,
             str(stats.get("commit_count", 0)),
-            f"{stats.get('percentage', 0.0):.1f}%"
+            f"{pct:.1f}%",
+            f"[green]{bar_visual}[/green]"
         )
         
     console.print(table)
     if res.get("bus_factor_risk") == "HIGH (Single Author Dominance)":
-        console.print(f"[bold yellow]Bus Factor Alert:[/bold yellow] Single author dominance detected (>60% commits).")
+        console.print(Panel(
+            "[bold red]⚠️  High Bus Factor Risk Detected:[/bold red] A single author accounts for >60% of all changes.\n"
+            "[dim]Recommendation: Distribute code reviews and documentation to avoid single-point knowledge loss.[/dim]",
+            border_style="bright_red",
+            box=box.ROUNDED
+        ))
 
 @app.command()
 def coupling(
@@ -338,19 +374,35 @@ def coupling(
     repo_id = _configure_repo_env(repo_path=repo, db_path=db_path)
     from archaeologist.mcp_server.tools import change_coupling_tool
     from rich.table import Table
+    from rich import box
     console = _get_console()
     
     res = change_coupling_tool(min_co_commits=min_co_commits, top_n=top_n, repo_id=repo_id)
     pairs = res if isinstance(res, list) else res.get("coupled_pairs", [])
     
-    table = Table(title="Temporal Change Coupling (Co-Changed Files)", border_style="magenta")
-    table.add_column("Rank", justify="right", style="cyan", no_wrap=True)
-    table.add_column("File A", style="white")
-    table.add_column("File B", style="white")
+    max_co = max([item.get("co_commit_count", 0) for item in pairs] or [1])
+    table = Table(
+        title="🔗 Temporal Change Coupling (Files Changed Together)",
+        border_style="magenta",
+        box=box.ROUNDED,
+        header_style="bold bright_white on dark_magenta"
+    )
+    table.add_column("Rank", justify="center", style="bold cyan", no_wrap=True)
+    table.add_column("File A", style="bright_white")
+    table.add_column("File B", style="bright_white")
     table.add_column("Co-Commits", justify="right", style="bold green")
+    table.add_column("Coupling Strength", justify="left", style="green")
     
     for idx, item in enumerate(pairs, 1):
-        table.add_row(str(idx), item.get("file_a", ""), item.get("file_b", ""), str(item.get("co_commit_count", 0)))
+        co_c = item.get("co_commit_count", 0)
+        bar_len = max(1, int((co_c / max_co) * 12)) if max_co > 0 else 1
+        table.add_row(
+            f"#{idx}",
+            item.get("file_a", ""),
+            item.get("file_b", ""),
+            str(co_c),
+            f"[green]{'█' * bar_len}[/green]"
+        )
         
     console.print(table)
 
@@ -364,16 +416,22 @@ def symbols(
     repo_id = _configure_repo_env(repo_path=repo, db_path=db_path)
     from archaeologist.mcp_server.tools import repo_symbols_tool
     from rich.table import Table
+    from rich import box
     console = _get_console()
     
     res = repo_symbols_tool(top_n=top_n, repo_id=repo_id)
     syms = res if isinstance(res, list) else res.get("symbols", [])
     
-    table = Table(title="AST Code Symbols by Modification Frequency", border_style="blue")
+    table = Table(
+        title="🧩 AST Code Symbols by Modification Frequency",
+        border_style="blue",
+        box=box.ROUNDED,
+        header_style="bold bright_white on dark_blue"
+    )
     table.add_column("Symbol Name", style="bold cyan")
     table.add_column("Kind", style="yellow")
-    table.add_column("File Path", style="white")
-    table.add_column("Modifications", justify="right", style="green")
+    table.add_column("File Path", style="dim white")
+    table.add_column("Modifications", justify="right", style="bold green")
     
     for s in syms:
         table.add_row(
@@ -395,15 +453,21 @@ def symbol_history(
     repo_id = _configure_repo_env(repo_path=repo, db_path=db_path)
     from archaeologist.mcp_server.tools import symbol_history_tool
     from rich.table import Table
+    from rich import box
     console = _get_console()
     
     commits = symbol_history_tool(symbol_query=symbol_query, repo_id=repo_id)
     
-    table = Table(title=f"Modification History for Symbol: {symbol_query}", border_style="cyan")
-    table.add_column("SHA", style="yellow", no_wrap=True)
+    table = Table(
+        title=f"📜 Historical Modifications for Symbol: [bold cyan]{symbol_query}[/bold cyan]",
+        border_style="cyan",
+        box=box.ROUNDED,
+        header_style="bold bright_white on dark_cyan"
+    )
+    table.add_column("SHA", style="bold yellow", no_wrap=True)
     table.add_column("Date", style="dim", no_wrap=True)
     table.add_column("Author", style="cyan")
-    table.add_column("Message", style="white")
+    table.add_column("Commit Message", style="white")
     
     for c in commits:
         table.add_row(
