@@ -2,13 +2,14 @@ import os
 import sys
 import re
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Callable, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from sqlmodel import select
 
 from archaeologist.storage.db import init_db, get_session_context
+from archaeologist.storage.paths import get_default_bm25_path
 from archaeologist.storage.models import Commit, PullRequest, Issue, Chunk, SymbolIndex
-from archaeologist.ingestion.git_parser import iter_commits, get_commit_diff, is_merge_commit
+from archaeologist.ingestion.git_parser import iter_commits, count_commits, get_commit_diff, is_merge_commit
 from archaeologist.ingestion.revert_detector import detect_revert_from_message, find_reverted_commit
 from archaeologist.ingestion.github_client import GitHubIngestionClient
 from archaeologist.ingestion.link_resolver import update_cross_links
@@ -27,11 +28,24 @@ from archaeologist.retrieval.vector_store import VectorStore
 from archaeologist.retrieval.bm25_index import BM25Index
 
 class IngestionPipeline:
-    def __init__(self, repo_path: str, repo_url: Optional[str] = None, since_date: Optional[str] = None, github_limit: int = 500, repo_id: Optional[str] = None):
+    def __init__(
+        self,
+        repo_path: str,
+        repo_url: Optional[str] = None,
+        since_date: Optional[str] = None,
+        github_limit: int = 500,
+        repo_id: Optional[str] = None,
+        progress_callback: Optional[Callable[[str, int, int, str, float], None]] = None,
+        github_token: Optional[str] = None,
+        gemini_key: Optional[str] = None
+    ):
         self.repo_path = repo_path
         self.repo_url = repo_url
         self.since_date = since_date
         self.github_limit = github_limit
+        self.progress_callback = progress_callback
+        self.github_token = github_token or os.getenv("GITHUB_TOKEN")
+        self.gemini_key = gemini_key or os.getenv("GEMINI_API_KEY")
         if repo_id:
             self.repo_id = repo_id
         elif repo_url:
@@ -40,25 +54,49 @@ class IngestionPipeline:
         else:
             self.repo_id = os.path.basename(os.path.abspath(repo_path)).lower()
 
-    def run(self):
-        print("Initializing metadata database...", file=sys.stderr)
-        init_db()
+    def _report_progress(self, phase: str, current: int, total: int, message: str, percent: float):
+        """Dispatches real-time percentage progress updates to active progress_callback or stderr."""
+        bounded_pct = min(100.0, max(0.0, float(percent)))
+        if self.progress_callback:
+            try:
+                self.progress_callback(phase, current, total, message, bounded_pct)
+            except Exception:
+                pass
+        else:
+            print(f"[{bounded_pct:3.0f}%] {message}", file=sys.stderr)
 
-        print("Initializing vector store collection...", file=sys.stderr)
+    def run(self):
+        from archaeologist.storage.paths import get_default_db_url, get_default_bm25_path
+        repo_db_url = get_default_db_url(self.repo_path)
+        os.environ["DATABASE_URL"] = repo_db_url
+        os.environ["BM25_INDEX_PATH"] = get_default_bm25_path(self.repo_path)
+        
+        self._report_progress("init", 0, 100, "Initializing metadata database...", 2.0)
+        init_db(repo_db_url)
+
+        self._report_progress("init", 50, 100, "Initializing vector store collection...", 5.0)
         embedder = Embedder()
         vector_store = VectorStore(vector_size=embedder.dimension)
         vector_store.init_collection()
         vector_store.close()
 
-
         # Step 1: Walk git log & Extract AST Symbol Graph at historical commit SHAs
-        print(f"Walking git log and extracting AST code symbols from {self.repo_path}...", file=sys.stderr)
+        total_commits = count_commits(self.repo_path, since=self.since_date)
+        if total_commits == 0:
+            total_commits = 1
+            
+        self._report_progress("commits", 0, total_commits, f"Scanning {total_commits} commits...", 6.0)
         new_commits_count = 0
         
         with get_session_context() as session:
-            existing_shas = set(session.exec(select(Commit.sha)).all())
+            query = select(Commit.sha)
+            if self.repo_id:
+                query = query.where(Commit.repo_id == self.repo_id)
+            existing_shas = set(session.exec(query).all())
             
+            c_idx = 0
             for c_data in iter_commits(self.repo_path, since=self.since_date):
+                c_idx += 1
                 if c_data["sha"] in existing_shas:
                     continue
                     
@@ -139,10 +177,20 @@ class IngestionPipeline:
                 existing_shas.add(c_data["sha"])
                 new_commits_count += 1
                 
-        print(f"Added {new_commits_count} new commits to SQLite.", file=sys.stderr)
+                c_pct = 6.0 + min(1.0, c_idx / total_commits) * 28.0
+                if c_idx % max(1, total_commits // 40) == 0 or c_idx == total_commits:
+                    self._report_progress(
+                        "commits",
+                        c_idx,
+                        total_commits,
+                        f"Parsed commit {c_idx}/{total_commits} ({c_data['sha'][:7]})",
+                        c_pct
+                    )
+                
+        self._report_progress("commits", total_commits, total_commits, f"Ingested {new_commits_count} commits into database", 35.0)
 
         # Step 1b: Codebase File Ingestion Pass
-        print("Chunking codebase source files...", file=sys.stderr)
+        self._report_progress("files", 0, 1, "Scanning codebase source files...", 36.0)
         all_chunks = []
 
         with get_session_context() as session:
@@ -175,11 +223,15 @@ class IngestionPipeline:
                         except Exception:
                             pass
             session.add_all([Chunk(**c) for c in all_chunks])
+        self._report_progress("files", len(all_chunks), len(all_chunks) or 1, f"Extracted {len(all_chunks)} source code files", 38.0)
 
         # Step 2: Revert Detection Resolution Pass
-        print("Running revert detection pass...", file=sys.stderr)
+        self._report_progress("reverts", 0, 1, "Detecting revert chains and supersessions...", 39.0)
         with get_session_context() as session:
-            revert_commits = session.exec(select(Commit).where(Commit.is_revert == True)).all()
+            rev_query = select(Commit).where(Commit.is_revert == True)
+            if self.repo_id:
+                rev_query = rev_query.where(Commit.repo_id == self.repo_id)
+            revert_commits = session.exec(rev_query).all()
             reverts_resolved = 0
             for r_commit in revert_commits:
                 if not r_commit.reverts_sha:
@@ -192,14 +244,14 @@ class IngestionPipeline:
                             orig_commit.superseded_by_sha = r_commit.sha
                             session.add(orig_commit)
                             reverts_resolved += 1
-        print(f"Resolved {reverts_resolved} reverts.", file=sys.stderr)
+        self._report_progress("reverts", 1, 1, f"Resolved {reverts_resolved} revert chains", 41.0)
 
         # Step 3: Fetch GitHub Issues and PRs (Historical order: direction='asc')
         if self.repo_url and self.github_limit > 0 and not os.getenv("SKIP_GITHUB_API"):
             try:
-                print(f"Fetching GitHub Issues and PRs for {self.repo_url} (limit={self.github_limit}, direction=asc)...", file=sys.stderr)
+                self._report_progress("github", 0, 1, f"Checking GitHub PRs & Issues for {self.repo_url}...", 42.0)
 
-                gh_client = GitHubIngestionClient(self.repo_url)
+                gh_client = GitHubIngestionClient(self.repo_url, token=self.github_token)
                 prs = gh_client.fetch_pull_requests(limit=self.github_limit, direction="asc")
                 issues = gh_client.fetch_issues(limit=self.github_limit, direction="asc")
                 
@@ -240,22 +292,29 @@ class IngestionPipeline:
                                 linked_pr_numbers=issue_data.get("linked_pr_numbers", [])
                             )
                             session.add(issue_obj)
+                self._report_progress("github", 1, 1, "GitHub metadata synchronized", 44.0)
             except Exception as e:
-                print(f"Notice: Skipping GitHub API ingestion ({e})", file=sys.stderr)
+                self._report_progress("github", 1, 1, f"Skipped GitHub API ({e})", 44.0)
         else:
-            print("No GitHub URL/remote origin provided. Skipping GitHub REST API ingestion.", file=sys.stderr)
+            self._report_progress("github", 1, 1, "Skipping remote GitHub API ingestion", 44.0)
 
         # Step 4: Cross-Link Resolution Pass
+        self._report_progress("links", 0, 1, "Updating commit cross-links...", 45.0)
         with get_session_context() as session:
             update_cross_links(session)
+        self._report_progress("links", 1, 1, "Commit cross-links synchronized", 47.0)
 
         # Step 5: Batched Chunking & Summarization Pass
-        print("Processing chunking rules & generating summaries with API request batching...", file=sys.stderr)
         summarizer = LLMSummarizer()
         
         with get_session_context() as session:
-            all_commits = session.exec(select(Commit)).all()
-            all_prs = session.exec(select(PullRequest)).all()
+            c_query = select(Commit)
+            pr_query = select(PullRequest)
+            if self.repo_id:
+                c_query = c_query.where(Commit.repo_id == self.repo_id)
+                pr_query = pr_query.where(PullRequest.repo_id == self.repo_id)
+            all_commits = session.exec(c_query).all()
+            all_prs = session.exec(pr_query).all()
             
             pr_by_commit = {}
             for p in all_prs:
@@ -273,11 +332,15 @@ class IngestionPipeline:
 
             diff_summaries = {}
             batch_size = 5
-            for i in range(0, len(eligible_diffs), batch_size):
+            total_diff_batches = max(1, (len(eligible_diffs) + batch_size - 1) // batch_size) if eligible_diffs else 1
+            self._report_progress("diffs", 0, total_diff_batches, f"Summarizing {len(eligible_diffs)} diffs in {total_diff_batches} batches...", 48.0)
+
+            for b_idx, i in enumerate(range(0, len(eligible_diffs), batch_size), 1):
                 batch = eligible_diffs[i:i + batch_size]
                 batch_res = summarizer.summarize_diff_batch(batch)
                 diff_summaries.update(batch_res)
-
+                diff_pct = 48.0 + (b_idx / total_diff_batches) * 23.0
+                self._report_progress("diffs", b_idx, total_diff_batches, f"Summarized diff batch {b_idx}/{total_diff_batches}", diff_pct)
 
             for c in all_commits:
                 summary = diff_summaries.get(c.sha)
@@ -303,7 +366,10 @@ class IngestionPipeline:
                     if not c_obj:
                         session.add(Chunk(**chunk_info))
 
-            all_issues = session.exec(select(Issue)).all()
+            iss_query = select(Issue)
+            if self.repo_id:
+                iss_query = iss_query.where(Issue.repo_id == self.repo_id)
+            all_issues = session.exec(iss_query).all()
             for i in all_issues:
                 issue_dict = i.model_dump()
                 issue_chunks = chunk_issue(issue=issue_dict, repo_id=self.repo_id)
@@ -318,11 +384,14 @@ class IngestionPipeline:
                 if not c_obj:
                     session.add(Chunk(**chunk_info))
 
+        self._report_progress("chunks", 1, 1, "Completed codebase chunking pass", 72.0)
 
         # Step 6: Indexing (BM25 + Qdrant)
-        print("Fetching chunks for indexing...", file=sys.stderr)
         with get_session_context() as session:
-            all_chunks_db = session.exec(select(Chunk)).all()
+            chk_query = select(Chunk)
+            if self.repo_id:
+                chk_query = chk_query.where(Chunk.repo_id == self.repo_id)
+            all_chunks_db = session.exec(chk_query).all()
             all_chunk_dicts = [
                 {
                     "id": c.id,
@@ -340,17 +409,20 @@ class IngestionPipeline:
             ]
 
         # 6a. BM25 Sparse Index
+        self._report_progress("bm25", 0, len(all_chunk_dicts) or 1, f"Fitting BM25 index on {len(all_chunk_dicts)} chunks...", 74.0)
         if all_chunk_dicts:
-            print(f"Fitting BM25 index on {len(all_chunk_dicts)} chunks...", file=sys.stderr)
             bm25 = BM25Index()
             bm25.fit(all_chunk_dicts)
-            bm25_save_path = os.getenv("BM25_INDEX_PATH", "bm25_index.bin")
+            bm25_save_path = get_default_bm25_path(self.repo_path)
             bm25.save(bm25_save_path)
-
+            self._report_progress("bm25", len(all_chunk_dicts), len(all_chunk_dicts), "BM25 index saved", 80.0)
 
         # 6b. Qdrant Dense Index
         with get_session_context() as session:
-            unembedded_chunks = session.exec(select(Chunk).where(Chunk.embedded == False)).all()
+            unemb_query = select(Chunk).where(Chunk.embedded == False)
+            if self.repo_id:
+                unemb_query = unemb_query.where(Chunk.repo_id == self.repo_id)
+            unembedded_chunks = session.exec(unemb_query).all()
             unembedded_dicts = [
                 {
                     "id": c.id,
@@ -366,8 +438,9 @@ class IngestionPipeline:
                 for c in unembedded_chunks
             ]
 
-        if unembedded_dicts:
-            print(f"Generating embeddings for {len(unembedded_dicts)} un-embedded chunks...", file=sys.stderr)
+        total_unembedded = len(unembedded_dicts)
+        if total_unembedded > 0:
+            self._report_progress("embeddings", 0, total_unembedded, f"Generating embeddings for {total_unembedded} chunks...", 83.0)
             texts = [c["text"] for c in unembedded_dicts]
             embeddings, success_flags = embedder.embed_texts(texts, return_success_flags=True)
             
@@ -386,12 +459,12 @@ class IngestionPipeline:
                             if c_db:
                                 c_db.embedded = True
                                 session.add(c_db)
-                    print(f"Incremental dense vector indexing complete! Indexed {len(successful_dicts)} chunks.", file=sys.stderr)
+                    self._report_progress("embeddings", len(successful_dicts), total_unembedded, f"Vector indexing complete ({len(successful_dicts)}/{total_unembedded})", 98.0)
                     vector_store.close()
                 else:
-                    print("Notice: No chunks were successfully embedded due to quota limits. Skipping Qdrant vector indexing.", file=sys.stderr)
+                    self._report_progress("embeddings", 0, total_unembedded, "Quota limit reached; using sparse index fallback", 98.0)
         else:
-            print("All chunks already embedded. Skipping dense vector re-embedding.", file=sys.stderr)
+            self._report_progress("embeddings", 1, 1, "All chunks already indexed in vector store", 98.0)
 
-        print("Ingestion pipeline completed successfully!", file=sys.stderr)
+        self._report_progress("complete", 1, 1, "Ingestion completed successfully!", 100.0)
 

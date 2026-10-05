@@ -468,10 +468,14 @@ async def get_leaderboard():
                 
     return {"leaderboard": results}
 
-# Mount static web UI directly from web/ directory
-static_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "web"))
-if os.path.exists(static_dir):
-    app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
+# Mount static web UI: support both installed pip package and local dev repo
+pkg_static_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "static"))
+dev_static_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "web"))
+
+if os.path.exists(pkg_static_dir) and os.path.exists(os.path.join(pkg_static_dir, "index.html")):
+    app.mount("/", StaticFiles(directory=pkg_static_dir, html=True), name="static")
+elif os.path.exists(dev_static_dir):
+    app.mount("/", StaticFiles(directory=dev_static_dir, html=True), name="static")
 
 if __name__ == "__main__":
     import uvicorn

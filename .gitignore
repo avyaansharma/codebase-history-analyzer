@@ -16,6 +16,7 @@ venv/
 qdrant_db/
 qdrant_storage/
 qdrant_storage_local/
+.archaeologist/
 .env
 
 
@@ -29,6 +30,8 @@ context.md
 bugs.md
 scratch/
 *.egg-info/
+graphify-out/
+brag-output/
 
 
 

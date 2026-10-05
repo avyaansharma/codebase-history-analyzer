@@ -1,12 +1,16 @@
 import os
 import sys
+import warnings
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue, MatchAny, Range, PayloadSchemaType
 from dotenv import load_dotenv
 
+from archaeologist.storage.paths import get_default_qdrant_path
+
 load_dotenv()
+warnings.filterwarnings("ignore", category=UserWarning, module="qdrant_client")
 
 class VectorStore:
     def __init__(self, collection_name: str = "repo_history", vector_size: Optional[int] = None):
@@ -27,9 +31,9 @@ class VectorStore:
         """Connects to server Qdrant if available, otherwise uses pure in-memory Qdrant (zero-ops, lock-free)."""
         try:
             if qdrant_api_key:
-                client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key, timeout=1.0)
+                client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key, timeout=1.0, check_compatibility=False)
             else:
-                client = QdrantClient(url=qdrant_url, timeout=1.0)
+                client = QdrantClient(url=qdrant_url, timeout=1.0, check_compatibility=False)
             client.get_collections()
             print(f"Connected to Qdrant server at {qdrant_url}", file=sys.stderr)
             self.is_in_memory_fallback = False
@@ -38,7 +42,7 @@ class VectorStore:
             print(f"Qdrant server at {qdrant_url} unavailable. Initializing lock-free in-memory Qdrant instance.", file=sys.stderr)
 
         self.is_in_memory_fallback = True
-        return QdrantClient(path="./qdrant_db")
+        return QdrantClient(path=get_default_qdrant_path(), check_compatibility=False)
 
 
     def init_collection(self):
@@ -69,21 +73,22 @@ class VectorStore:
                 vectors_config=VectorParams(size=self.vector_size, distance=Distance.COSINE),
             )
 
-        # Create payload indexes for fast filtered searches
-        for field_name, schema_type in [
-            ("file_paths", PayloadSchemaType.KEYWORD),
-            ("source_type", PayloadSchemaType.KEYWORD),
-            ("is_reverted", PayloadSchemaType.BOOL),
-            ("timestamp_unix", PayloadSchemaType.INTEGER),
-        ]:
-            try:
-                self.client.create_payload_index(
-                    collection_name=self.collection_name,
-                    field_name=field_name,
-                    field_schema=schema_type
-                )
-            except Exception:
-                pass
+        # Create payload indexes for fast filtered searches in server mode (local mode indexes automatically)
+        if not self.is_in_memory_fallback:
+            for field_name, schema_type in [
+                ("file_paths", PayloadSchemaType.KEYWORD),
+                ("source_type", PayloadSchemaType.KEYWORD),
+                ("is_reverted", PayloadSchemaType.BOOL),
+                ("timestamp_unix", PayloadSchemaType.INTEGER),
+            ]:
+                try:
+                    self.client.create_payload_index(
+                        collection_name=self.collection_name,
+                        field_name=field_name,
+                        field_schema=schema_type
+                    )
+                except Exception:
+                    pass
 
     def upsert_chunks(self, chunks: List[dict], embeddings: List[List[float]], batch_size: int = 100):
         """Upserts chunks and their embeddings to Qdrant in batches of batch_size."""

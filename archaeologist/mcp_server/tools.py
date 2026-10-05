@@ -38,9 +38,12 @@ def search_history_tool(
 ) -> List[Dict[str, Any]]:
     """Hybrid search over commit/PR/issue history for a repo."""
     bm25 = BM25Index()
+    from archaeologist.storage.paths import get_default_bm25_path
+    custom_bm25 = os.getenv("BM25_INDEX_PATH")
+    bm25_path = custom_bm25 or ("bm25_index.bin" if os.path.exists("bm25_index.bin") else get_default_bm25_path())
     sparse_hits = []
-    if os.path.exists("bm25_index.bin"):
-        bm25.load("bm25_index.bin")
+    if os.path.exists(bm25_path):
+        bm25.load(bm25_path)
         sparse_hits = bm25.search(query, limit=30, file_path=file_path, source_types=source_types)
 
     embedder = Embedder()
@@ -231,11 +234,14 @@ def blame_explain_tool(
         "explanation": explanation
     }
 
-def repo_hotspots_tool(top_n: int = 15) -> List[Dict[str, Any]]:
+def repo_hotspots_tool(top_n: int = 15, repo_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """Calculates top churn files in the repo ranked by commit count."""
     file_counts = Counter()
     with get_session_context() as session:
-        commits = session.exec(select(Commit)).all()
+        query = select(Commit)
+        if repo_id:
+            query = query.where(Commit.repo_id == repo_id)
+        commits = session.exec(query).all()
         for c in commits:
             files = _get_json_list(c.files_changed)
             for f in files:
@@ -246,13 +252,16 @@ def repo_hotspots_tool(top_n: int = 15) -> List[Dict[str, Any]]:
         hotspots.append({"file_path": fpath, "commit_count": count})
     return hotspots
 
-def repo_ownership_tool(file_path: Optional[str] = None) -> Dict[str, Any]:
+def repo_ownership_tool(file_path: Optional[str] = None, repo_id: Optional[str] = None) -> Dict[str, Any]:
     """Calculates author percentage contribution distribution and bus factor risk."""
     author_counts = Counter()
     file_author_counts = defaultdict(Counter)
     total_commits = 0
     with get_session_context() as session:
-        commits = session.exec(select(Commit)).all()
+        query = select(Commit)
+        if repo_id:
+            query = query.where(Commit.repo_id == repo_id)
+        commits = session.exec(query).all()
         for c in commits:
             files = _get_json_list(c.files_changed)
             if not file_path or file_path in files:
@@ -294,15 +303,17 @@ def repo_ownership_tool(file_path: Optional[str] = None) -> Dict[str, Any]:
             }
         res["per_file_breakdown"] = file_breakdown
 
-
     return res
 
 
-def change_coupling_tool(min_co_commits: int = 2, top_n: int = 15) -> List[Dict[str, Any]]:
+def change_coupling_tool(min_co_commits: int = 2, top_n: int = 15, repo_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """Identifies pairs of files that frequently change together in the same commit."""
     pair_counts = Counter()
     with get_session_context() as session:
-        commits = session.exec(select(Commit)).all()
+        query = select(Commit)
+        if repo_id:
+            query = query.where(Commit.repo_id == repo_id)
+        commits = session.exec(query).all()
         for c in commits:
             files = sorted(list(set(_get_json_list(c.files_changed))))
             if len(files) > 15:
@@ -321,10 +332,13 @@ def change_coupling_tool(min_co_commits: int = 2, top_n: int = 15) -> List[Dict[
             })
     return couplings
 
-def repo_symbols_tool(top_n: int = 20) -> List[Dict[str, Any]]:
+def repo_symbols_tool(top_n: int = 20, repo_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """Lists extracted AST code symbols (classes, functions, methods) ranked by modification frequency."""
     with get_session_context() as session:
-        symbols = session.exec(select(SymbolIndex).order_by(SymbolIndex.commit_count.desc()).limit(top_n)).all()
+        query = select(SymbolIndex).order_by(SymbolIndex.commit_count.desc())
+        if repo_id:
+            query = query.where(SymbolIndex.repo_id == repo_id)
+        symbols = session.exec(query.limit(top_n)).all()
         return [
             {
                 "symbol_id": s.symbol_id,
@@ -336,11 +350,14 @@ def repo_symbols_tool(top_n: int = 20) -> List[Dict[str, Any]]:
             for s in symbols
         ]
 
-def symbol_history_tool(symbol_query: str) -> List[Dict[str, Any]]:
+def symbol_history_tool(symbol_query: str, repo_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """Retrieves all commits that modified a specific AST Code Symbol (e.g. 'AuthService' or 'login')."""
     matching_commits = []
     with get_session_context() as session:
-        commits = session.exec(select(Commit)).all()
+        query = select(Commit)
+        if repo_id:
+            query = query.where(Commit.repo_id == repo_id)
+        commits = session.exec(query).all()
         for c in commits:
             syms = _get_json_list(c.symbols_modified)
             if any(symbol_query.lower() in s.lower() for s in syms):

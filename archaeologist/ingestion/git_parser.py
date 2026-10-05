@@ -7,6 +7,20 @@ from archaeologist.utils.security import validate_repo_path, sanitize_sha
 COMMIT_DELIM = "\x1e"   # record separator
 FIELD_DELIM = "\x1f"    # unit separator
 
+def count_commits(repo_path: str, since: Optional[str] = None) -> int:
+    """Quickly returns total commit count using git rev-list for accurate progress calculation."""
+    try:
+        validated_path = validate_repo_path(repo_path)
+        cmd = ["git", "-C", validated_path, "rev-list", "--count", "HEAD"]
+        if since:
+            cmd += [f"--since={since}"]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        if res.returncode == 0 and res.stdout.strip().isdigit():
+            return int(res.stdout.strip())
+    except Exception:
+        pass
+    return 0
+
 def iter_commits(repo_path: str, since: Optional[str] = None) -> Iterator[dict]:
     """Yields raw commit dicts one at a time. O(1) memory regardless of repo size."""
     validated_path = validate_repo_path(repo_path)

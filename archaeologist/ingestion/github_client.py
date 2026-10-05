@@ -22,7 +22,15 @@ class GitHubIngestionClient:
         try:
             self.repo = self.gh.get_repo(f"{self.owner}/{self.repo_name}")
         except Exception as e:
-            print(f"Notice: Could not access GitHub repository metadata for '{self.owner}/{self.repo_name}': {e}", file=sys.stderr)
+            err_str = str(e)
+            if "401" in err_str or "Bad credentials" in err_str:
+                print("Notice: GITHUB_TOKEN is invalid or expired (401 Bad credentials). Continuing in offline mode with local git history.", file=sys.stderr)
+            elif "404" in err_str:
+                print(f"Notice: GitHub repository '{self.owner}/{self.repo_name}' not found or private. Continuing in offline mode with local git history.", file=sys.stderr)
+            elif "rate limit" in err_str.lower() or "403" in err_str:
+                print("Notice: GitHub API rate limit reached. Continuing in offline mode with local git history.", file=sys.stderr)
+            else:
+                print(f"Notice: Could not access GitHub repository metadata for '{self.owner}/{self.repo_name}': {e}", file=sys.stderr)
             self.repo = None
 
 

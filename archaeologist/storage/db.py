@@ -6,9 +6,11 @@ from typing import Generator, Optional
 from sqlmodel import SQLModel, create_engine, Session
 from dotenv import load_dotenv
 
+from archaeologist.storage.paths import get_default_db_url
+
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./archaeologist.db")
+DATABASE_URL = get_default_db_url()
 
 # Configure engine with multi-thread support and SQLite optimizations
 engine = create_engine(
@@ -49,7 +51,7 @@ def init_db(db_url: Optional[str] = None):
 def get_session() -> Session:
     """Returns a new SQLModel database session, dynamically syncing with active DATABASE_URL."""
     global engine, DATABASE_URL
-    current_url = os.getenv("DATABASE_URL", "sqlite:///./archaeologist.db")
+    current_url = get_default_db_url()
     if current_url != DATABASE_URL:
         init_db(current_url)
     return Session(engine)
@@ -58,7 +60,7 @@ def get_session() -> Session:
 def get_session_context() -> Generator[Session, None, None]:
     """Context manager yielding a session with dynamic DATABASE_URL synchronization and automatic rollback."""
     global engine, DATABASE_URL
-    current_url = os.getenv("DATABASE_URL", "sqlite:///./archaeologist.db")
+    current_url = get_default_db_url()
     if current_url != DATABASE_URL:
         init_db(current_url)
     session = Session(engine)

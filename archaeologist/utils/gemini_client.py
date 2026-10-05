@@ -3,9 +3,13 @@ import json
 import re
 import time
 import threading
+import warnings
 from typing import Optional, Dict, Any, List
 from google import genai
 from google.genai import types
+
+warnings.filterwarnings("ignore", category=UserWarning, module="google.genai")
+warnings.filterwarnings("ignore", message=".*automatic function calling.*")
 
 DEFAULT_MODEL = "gemini-3.5-flash"
 FALLBACK_MODELS = [

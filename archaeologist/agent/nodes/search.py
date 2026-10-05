@@ -57,7 +57,15 @@ def search_node(state: AgentState) -> dict:
     repo_id = state.get("repo_id") or plan.get("repo_id")
 
     bm25 = BM25Index()
-    bm25_path = os.path.abspath(os.getenv("BM25_INDEX_PATH", "bm25_index.bin"))
+    from archaeologist.storage.paths import get_default_bm25_path
+    custom_bm25 = os.getenv("BM25_INDEX_PATH")
+    if custom_bm25:
+        bm25_path = os.path.abspath(custom_bm25)
+    elif os.path.exists("bm25_index.bin"):
+        bm25_path = os.path.abspath("bm25_index.bin")
+    else:
+        bm25_path = os.path.abspath(get_default_bm25_path())
+
     has_bm25 = os.path.exists(bm25_path)
     if has_bm25:
         bm25.load(bm25_path)
